@@ -5,158 +5,94 @@
 const chai = require('chai')
 const dirtyChai = require('dirty-chai')
 const expect = chai.expect
-const waterfall = require('async/waterfall')
+const series = require('async/series')
 const parallel = require('async/parallel')
+const waterfall = require('async/waterfall')
+const bl = require('bl')
 
-const PeerId = require('peer-id')
 const IPFS = require('../../src/core')
 const createTempRepo = require('../utils/create-repo-nodejs.js')
-const Factory = require('../utils/ipfs-factory-daemon')
-const relayConfig = require('../utils/ipfs-factory-daemon/default-config.json')
+
+const IPFSAPI = require('ipfs-api')
 
 chai.use(dirtyChai)
+
+function setupNode (addrs) {
+  return new IPFS({
+    init: true,
+    start: true,
+    repo: createTempRepo(),
+    config: {
+      Addresses: {
+        Swarm: addrs
+      },
+      Bootstrap: [],
+      EXPERIMENTAL: {
+        Relay: {
+          Enabled: true
+        }
+      }
+    }
+  })
+}
 
 describe('circuit', function () {
   this.timeout(20 * 1000)
 
-  let ipfsDst
-  let ipfsSrc
-  let relayPeer
+  let relayApi
+  let ipfsWS
+  let ipfsTCP
   let relayAddrs
-  let factory = new Factory()
 
   before((done) => {
-    ipfsDst = new IPFS({
-      repo: createTempRepo(),
-      start: false,
-      config: {
-        Addresses: {
-          Swarm: [
-            '/ip4/0.0.0.0/tcp/9002'
-          ]
-        },
-        Bootstrap: [],
-        EXPERIMENTAL: {
-          Relay: {
-            Enabled: true
-          }
-        }
-      }
-    })
+    relayApi = new IPFSAPI(`/ip4/127.0.0.1/tcp/3107`)
 
-    ipfsSrc = new IPFS({
-      repo: createTempRepo(),
-      start: false,
-      config: {
-        Addresses: {
-          Swarm: [
-            '/ip4/0.0.0.0/tcp/9003/ws'
-          ]
-        },
-        Bootstrap: [],
-        EXPERIMENTAL: {
-          Relay: {
-            Enabled: true
-          }
-        }
-      }
-    })
+    ipfsTCP = setupNode()
 
-    waterfall([
-      (pCb) => {
-        PeerId.create({ bits: 1024 }, (err, id) => {
-          if (err) {
-            return pCb(err)
-          }
+    ipfsWS = setupNode()
 
-          const peerId = id.toJSON()
-          relayConfig.Identity.PeerID = peerId.id
-          relayConfig.Identity.PrivKey = peerId.privKey
-          relayConfig.Addresses.Swarm = [
-            '/ip4/127.0.0.1/tcp/61452/ws',
-            '/ip4/127.0.0.1/tcp/61453'
-          ]
-          pCb()
-        })
-      },
-      (pCb) => {
-        factory.spawnNode(createTempRepo(), Object.assign(relayConfig, {
-          EXPERIMENTAL: {
-            Relay: {
-              Enabled: true,
-              HOP: {
-                Enabled: true,
-                Active: false
-              }
-            }
-          }
-        }), (err, node) => {
-          expect(err).to.not.exist()
-          relayPeer = node
-          pCb()
-        })
-      },
-      (pCb) => {
-        relayPeer.swarm.localAddrs((err, addrs) => {
-          expect(err).to.not.exist()
-          relayAddrs = addrs
-          pCb()
-        })
-      },
-      (pCb) => ipfsSrc.start(pCb),
-      (pCb) => ipfsDst.start(pCb)
-    ], (err) => {
+    parallel([
+      (cb) => ipfsWS.on('start', cb),
+      (cb) => ipfsTCP.on('start', cb),
+      (cb) => relayApi.id(cb)
+    ], (err, res) => {
       expect(err).to.not.exist()
-      let addr = relayAddrs.filter((a) => !a.toString().includes('/p2p-circuit'))
-      parallel([
-        (cb) => ipfsSrc.swarm.connect(addr[0], cb),
-        (cb) => ipfsDst.swarm.connect(addr[1], cb)
-      ], (err) => setTimeout(done, 2000, err))
+      relayAddrs = res[2].addresses
+      series([
+        (pCb) => ipfsTCP.swarm.connect(relayAddrs[0], pCb),
+        (pCb) => ipfsWS.swarm.connect(relayAddrs[1], pCb),
+        (pCb) => setTimeout(pCb, 2000)
+      ], (err) => {
+        expect(err).to.not.exist()
+        done()
+      })
     })
   })
 
   after((done) => {
-    waterfall([
-      (cb) => ipfsSrc.stop(() => cb()),
-      (cb) => ipfsDst.stop(() => cb()),
-      (cb) => factory.dismantle((err) => done(err))
+    series([
+      (cb) => ipfsTCP.stop(cb),
+      (cb) => ipfsWS.stop(cb)
     ], done)
   })
 
   it('should be able to connect over circuit', (done) => {
-    ipfsSrc.swarm.connect(ipfsDst._peerInfo, (err, conn) => {
+    ipfsTCP.swarm.connect(ipfsWS._peerInfo, (err) => {
       expect(err).to.not.exist()
       done()
     })
   })
 
   it('should be able to transfer data over circuit', (done) => {
+    const msg = new Buffer('Hello world over circuit!')
     waterfall([
-      (cb) => ipfsDst.swarm.connect(ipfsSrc._peerInfo, cb),
-      (conn, cb) => ipfsDst.files.add(new ipfsDst.types.Buffer('Hello world over circuit!'),
-        (err, res) => {
-          expect(err).to.be.null()
-          expect(res[0]).to.not.be.null()
-          cb(null, res[0].hash)
-        }),
-      (hash, cb) => ipfsSrc.files.cat(hash, function (err, stream) {
-        expect(err).to.be.null()
-
-        var res = ''
-
-        stream.on('data', function (chunk) {
-          res += chunk.toString()
-        })
-
-        stream.on('error', function (err) {
-          cb(err)
-        })
-
-        stream.on('end', function () {
-          expect(res).to.be.equal('Hello world over circuit!')
-          cb(null, res)
-        })
-      })
-    ], done)
+      (cb) => ipfsWS.files.add(msg, cb),
+      (res, cb) => ipfsTCP.files.cat(res[0].hash, cb),
+      (stream, cb) => stream.pipe(bl(cb))
+    ], (err, data) => {
+      expect(err).to.not.exist()
+      expect(msg).to.be.eql(data)
+      done()
+    })
   })
 })
